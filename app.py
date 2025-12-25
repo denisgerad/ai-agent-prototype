@@ -1,4 +1,4 @@
-#PDF + Tools + Agent
+#PDF + Tools + Agent + Debug Agent
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -7,8 +7,14 @@ from langchain_ollama import OllamaLLM
 from langchain_classic.chains import RetrievalQA
 from langchain_classic.tools import Tool
 from langchain_classic.agents import initialize_agent, AgentType
-from langchain.memory import ConversationBufferMemory
+from langchain_classic.memory import ConversationBufferMemory
 import requests
+import sys
+import os
+
+# Add agents directory to path
+sys.path.append(os.path.join(os.path.dirname(__file__), 'agents'))
+from debug_agent import DebugAgent
 
 # ---------- CONFIG ----------
 PDF_PATH = "sample.pdf"
@@ -33,30 +39,30 @@ def scrape_website(url: str) -> str:
 
 
 def main():
-    print("📄 Loading PDF...")
+    print("[*] Loading PDF...")
     loader = PyPDFLoader(PDF_PATH)
     documents = loader.load()
 
-    print("✂️ Chunking documents...")
+    print("[*] Chunking documents...")
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
     )
     chunks = splitter.split_documents(documents)
 
-    print("🔢 Creating embeddings...")
+    print("[*] Creating embeddings...")
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL
     )
 
-    print("📦 Creating vector store...")
+    print("[*] Creating vector store...")
     vectordb = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
         persist_directory=CHROMA_DIR
     )
 
-    print("🤖 Initializing LLM...")
+    print("[*] Initializing LLM...")
     llm = OllamaLLM(model=OLLAMA_MODEL)
 
     # ---------- PDF QA ----------
@@ -93,6 +99,16 @@ def main():
         return_messages=True,
         output_key="output"
     )
+    
+    # ---------- DEBUG MEMORY ----------
+    debug_memory = ConversationBufferMemory(
+        memory_key="debug_history",
+        return_messages=True,
+        output_key="output"
+    )
+    
+    # ---------- DEBUG AGENT ----------
+    debug_agent = DebugAgent()
 
     # ---------- AGENT ----------
     agent = initialize_agent(
@@ -114,20 +130,67 @@ Always provide the most relevant and contextual answer based on the full convers
         }
     )
 
-    print("\n✅ Agent ready with conversation memory! Ask anything (type 'exit' to quit, 'clear' to reset memory)\n")
+    print("\n[+] Agent ready with conversation memory! Ask anything (type 'exit' to quit, 'clear' to reset memory, 'debug mode' to enter debug mode)\n")
 
+    debug_mode = False
+    
     while True:
-        query = input("❓ Question: ")
+        mode_indicator = "[DEBUG]" if debug_mode else "[?]"
+        query = input(f"{mode_indicator} Question: ")
+        
         if query.lower() == "exit":
             break
         
         if query.lower() == "clear":
             memory.clear()
-            print("\n🧹 Conversation memory cleared!\n")
+            debug_memory.clear()
+            debug_agent.reset()
+            print("\n[*] Conversation memory cleared!\n")
             continue
-
-        response = agent.run(query)
-        print("\n💡 Answer:\n", response, "\n")
+        
+        if query.lower() == "debug mode":
+            debug_mode = not debug_mode
+            status = "ON" if debug_mode else "OFF"
+            print(f"\n[DEBUG] Debug mode {status}\n")
+            continue
+        
+        # Route to debug agent if debug keywords detected or in debug mode
+        if debug_mode or debug_agent.is_debug_query(query):
+            print("\n[*] Routing to Debug Agent...\n")
+            
+            # Get conversation history from debug memory
+            history = ""
+            if hasattr(debug_memory, 'chat_memory') and hasattr(debug_memory.chat_memory, 'messages'):
+                for msg in debug_memory.chat_memory.messages:
+                    if hasattr(msg, 'type'):
+                        if msg.type == 'human':
+                            history += f"User: {msg.content}\n"
+                        elif msg.type == 'ai':
+                            history += f"Assistant: {msg.content}\n"
+            
+            # Handle with debug agent
+            result = debug_agent.handle(query, conversation_history=history)
+            
+            if result["mode"] == "INVESTIGATION":
+                print("\n" + result["formatted_response"] + "\n")
+                # Store in debug memory
+                debug_memory.save_context(
+                    {"input": query},
+                    {"output": result["formatted_response"]}
+                )
+            else:
+                # ANALYSIS mode - send prompt to LLM
+                llm_response = llm.invoke(result["prompt"])
+                print("\n[*] Debug Analysis:\n", llm_response, "\n")
+                # Store in debug memory
+                debug_memory.save_context(
+                    {"input": query},
+                    {"output": llm_response}
+                )
+        else:
+            # Normal agent flow
+            response = agent.run(query)
+            print("\n[*] Answer:\n", response, "\n")
 
 
 if __name__ == "__main__":

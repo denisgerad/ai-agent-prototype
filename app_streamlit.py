@@ -1,4 +1,4 @@
-#PDF + Tools + Agent with Streamlit UI
+#PDF + Tools + Agent + Debug Agent with Streamlit UI
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -11,6 +11,12 @@ from langchain_classic.agents import initialize_agent, AgentType
 from langchain_classic.memory import ConversationBufferMemory
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 import requests
+import sys
+import os
+
+# Add agents directory to path
+sys.path.append(os.path.join(os.path.dirname(__file__), 'agents'))
+from debug_agent import DebugAgent
 
 # ---------- CONFIG ----------
 PDF_PATH = "sample.pdf"
@@ -123,12 +129,25 @@ def main():
         layout="wide"
     )
 
-    st.title("🤖 RAG Agent with Tools")
-    st.markdown("Chat with your PDF, get weather, and scrape websites!")
+    st.title("🤖 RAG Agent with Tools & Debug Mode")
+    st.markdown("Chat with your PDF, get weather, scrape websites, and get intelligent debugging help!")
 
     # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    
+    if "debug_mode" not in st.session_state:
+        st.session_state.debug_mode = False
+    
+    if "debug_agent" not in st.session_state:
+        st.session_state.debug_agent = DebugAgent()
+    
+    if "debug_memory" not in st.session_state:
+        st.session_state.debug_memory = ConversationBufferMemory(
+            memory_key="debug_history",
+            return_messages=True,
+            output_key="output"
+        )
     
     if "agent" not in st.session_state:
         with st.spinner("🔧 Initializing agent system..."):
@@ -169,9 +188,20 @@ Always provide the most relevant and contextual answer based on the full convers
     with st.sidebar:
         st.header("🛠️ Controls")
         
+        # Debug Mode Toggle
+        debug_mode = st.toggle("🐛 Debug Mode", value=st.session_state.debug_mode)
+        if debug_mode != st.session_state.debug_mode:
+            st.session_state.debug_mode = debug_mode
+            st.rerun()
+        
+        if st.session_state.debug_mode:
+            st.info("🐛 Debug mode is ON - Bug reports will be intelligently analyzed")
+        
         if st.button("🗑️ Clear Conversation", use_container_width=True):
             st.session_state.messages = []
             st.session_state.memory.clear()
+            st.session_state.debug_memory.clear()
+            st.session_state.debug_agent.reset()
             st.rerun()
         
         st.divider()
@@ -182,17 +212,22 @@ Always provide the most relevant and contextual answer based on the full convers
         - **Weather**: Get weather for any city
         - **Web_Scraper**: Extract text from URLs
         - **Web_Search**: Search the internet (like Google)
+        - **🐛 Debug Agent**: Intelligent bug analysis
         """)
         
         st.divider()
         
         st.header("💡 Example Questions")
         st.markdown("""
+        **Normal Mode:**
         - "What is the PDF about?"
         - "What's the weather in London?"
-        - "Scrape https://example.com"
-        - "What is one tap trading?" (web search)
-        - "Summarize the security section" (follow-up)
+        - "Search for Python tutorials"
+        
+        **Debug Mode:**
+        - "My delete function works on PC but not on mobile"
+        - "Getting 'no token' error on iPhone Safari"
+        - "App crashes only sometimes on Android"
         """)
 
     # Display chat messages
@@ -207,18 +242,111 @@ Always provide the most relevant and contextual answer based on the full convers
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        # Check if should use debug agent
+        # First check if debug mode is enabled
+        # Then check for debug keywords OR environmental signals
+        use_debug = st.session_state.debug_mode
+        
+        if not use_debug:
+            # Check for explicit debug keywords
+            use_debug = st.session_state.debug_agent.is_debug_query(prompt)
+        
+        if not use_debug:
+            # Check for environmental signals even without explicit bug keywords
+            from signal_detector import detect_signals, should_investigate
+            signals = detect_signals(prompt)
+            use_debug = should_investigate(signals)
+
         # Get agent response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
+            with st.spinner("Thinking..." if not use_debug else "🐛 Analyzing with Debug Agent..."):
                 try:
-                    response = st.session_state.agent.run(prompt)
-                    
-                    # Clean up any error messages in the response
-                    if "For troubleshooting, visit:" in response:
-                        response = response.split("For troubleshooting, visit:")[0].strip()
-                    
-                    st.markdown(response)
-                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    if use_debug:
+                        # Extract conversation history from debug memory
+                        history = ""
+                        if hasattr(st.session_state.debug_memory, 'chat_memory') and hasattr(st.session_state.debug_memory.chat_memory, 'messages'):
+                            for msg in st.session_state.debug_memory.chat_memory.messages:
+                                if hasattr(msg, 'type'):
+                                    if msg.type == 'human':
+                                        history += f"User: {msg.content}\n"
+                                    elif msg.type == 'ai':
+                                        history += f"Assistant: {msg.content}\n"
+                        
+                        # Handle with debug agent
+                        result = st.session_state.debug_agent.handle(prompt, conversation_history=history)
+                        
+                        if result["mode"] == "INVESTIGATION":
+                            response = result["formatted_response"]
+                            st.markdown(response)
+                            # Store in debug memory
+                            st.session_state.debug_memory.save_context(
+                                {"input": prompt},
+                                {"output": response}
+                            )
+                        else:
+                            # ANALYSIS mode - send to LLM
+                            llm, _ = initialize_agent_system()
+                            response = llm.invoke(result["prompt"])
+                            
+                            # Display the LLM analysis first
+                            st.markdown("### 🤖 AI Analysis")
+                            st.markdown(response)
+                            
+                            # Display confirmation gate BEFORE fix strategies
+                            if result.get("confirmation_gate"):
+                                st.markdown("---")
+                                st.warning(result["confirmation_gate"])
+                            
+                            # Display additional analysis components
+                            if result.get("root_cause_scores"):
+                                st.markdown("---")
+                                st.markdown(result["root_cause_scores"])
+                            
+                            if result.get("verification_tests"):
+                                st.markdown("---")
+                                st.markdown(result["verification_tests"])
+                            
+                            if result.get("inspection_checklist"):
+                                st.markdown("---")
+                                st.markdown(result["inspection_checklist"])
+                            
+                            # Show fix strategies only if no confirmation gate or after confirmation
+                            if result.get("fix_strategies") and not result.get("confirmation_gate"):
+                                st.markdown("---")
+                                st.markdown(result["fix_strategies"])
+                            elif result.get("fix_strategies") and result.get("confirmation_gate"):
+                                st.info("💡 Fix strategies will be provided after you confirm the exact issue above.")
+                            
+                            # Combine all for storage
+                            full_response = response
+                            if result.get("confirmation_gate"):
+                                full_response += "\n\n" + result["confirmation_gate"]
+                            if result.get("root_cause_scores"):
+                                full_response += "\n\n" + result["root_cause_scores"]
+                            if result.get("verification_tests"):
+                                full_response += "\n\n" + result["verification_tests"]
+                            if result.get("inspection_checklist"):
+                                full_response += "\n\n" + result["inspection_checklist"]
+                            if result.get("fix_strategies") and not result.get("confirmation_gate"):
+                                full_response += "\n\n" + result["fix_strategies"]
+                            
+                            # Store in debug memory
+                            st.session_state.debug_memory.save_context(
+                                {"input": prompt},
+                                {"output": full_response}
+                            )
+                        
+                        st.session_state.messages.append({"role": "assistant", "content": response if result["mode"] == "INVESTIGATION" else full_response})
+                    else:
+                        # Normal agent flow
+                        response = st.session_state.agent.run(prompt)
+                        
+                        # Clean up any error messages in the response
+                        if "For troubleshooting, visit:" in response:
+                            response = response.split("For troubleshooting, visit:")[0].strip()
+                        
+                        st.markdown(response)
+                        st.session_state.messages.append({"role": "assistant", "content": response})
                 except Exception as e:
                     error_str = str(e)
                     
