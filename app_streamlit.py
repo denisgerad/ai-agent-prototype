@@ -17,6 +17,7 @@ import os
 # Add agents directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'agents'))
 from debug_agent import DebugAgent
+from architect_agent import ArchitectAgent
 
 # ---------- CONFIG ----------
 PDF_PATH = "sample.pdf"
@@ -124,27 +125,42 @@ def initialize_agent_system():
 
 def main():
     st.set_page_config(
-        page_title="RAG Agent Chat",
+        page_title="Multi-Agent RAG System",
         page_icon="🤖",
         layout="wide"
     )
 
-    st.title("🤖 RAG Agent with Tools & Debug Mode")
-    st.markdown("Chat with your PDF, get weather, scrape websites, and get intelligent debugging help!")
+    st.title("🤖 Multi-Agent RAG System")
+    st.markdown("Choose your agent: Generic (task execution), Debug (investigation), or Architect (system design)")
 
     # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
     
-    if "debug_mode" not in st.session_state:
-        st.session_state.debug_mode = False
+    if "agent_mode" not in st.session_state:
+        st.session_state.agent_mode = "Generic Agent"
+    
+    if "architect_confidence_mode" not in st.session_state:
+        st.session_state.architect_confidence_mode = False
     
     if "debug_agent" not in st.session_state:
         st.session_state.debug_agent = DebugAgent()
     
+    if "architect_agent" not in st.session_state:
+        # Initialize with the LLM wrapper
+        llm, _ = initialize_agent_system()
+        st.session_state.architect_agent = ArchitectAgent(model=lambda prompt: llm.invoke(prompt))
+    
     if "debug_memory" not in st.session_state:
         st.session_state.debug_memory = ConversationBufferMemory(
             memory_key="debug_history",
+            return_messages=True,
+            output_key="output"
+        )
+    
+    if "architect_memory" not in st.session_state:
+        st.session_state.architect_memory = ConversationBufferMemory(
+            memory_key="architect_history",
             return_messages=True,
             output_key="output"
         )
@@ -188,47 +204,101 @@ Always provide the most relevant and contextual answer based on the full convers
     with st.sidebar:
         st.header("🛠️ Controls")
         
-        # Debug Mode Toggle
-        debug_mode = st.toggle("🐛 Debug Mode", value=st.session_state.debug_mode)
-        if debug_mode != st.session_state.debug_mode:
-            st.session_state.debug_mode = debug_mode
+        # Agent Mode Selection (Radio Buttons)
+        st.subheader("🤖 Agent Mode")
+        agent_mode = st.radio(
+            "Select Agent:",
+            ["Generic Agent", "Debug Agent", "Architect Agent"],
+            index=["Generic Agent", "Debug Agent", "Architect Agent"].index(st.session_state.agent_mode),
+            help="Choose which agent to use for your queries"
+        )
+        
+        if agent_mode != st.session_state.agent_mode:
+            st.session_state.agent_mode = agent_mode
             st.rerun()
         
-        if st.session_state.debug_mode:
-            st.info("🐛 Debug mode is ON - Bug reports will be intelligently analyzed")
+        # Confidence Mode Toggle (only for Architect Agent)
+        if st.session_state.agent_mode == "Architect Agent":
+            confidence_mode = st.checkbox(
+                "🎯 Include Confidence & Assumptions",
+                value=st.session_state.architect_confidence_mode,
+                help="Add confidence scores and explicit assumptions to architecture analysis"
+            )
+            if confidence_mode != st.session_state.architect_confidence_mode:
+                st.session_state.architect_confidence_mode = confidence_mode
+        
+        # Show current mode info
+        if st.session_state.agent_mode == "Generic Agent":
+            st.info("💬 Generic Agent - Task execution with tools")
+        elif st.session_state.agent_mode == "Debug Agent":
+            st.info("🐛 Debug Agent - Investigation-first reasoning")
+        elif st.session_state.agent_mode == "Architect Agent":
+            st.info("🏗️ Architect Agent - System architecture analysis")
         
         if st.button("🗑️ Clear Conversation", use_container_width=True):
             st.session_state.messages = []
             st.session_state.memory.clear()
             st.session_state.debug_memory.clear()
+            st.session_state.architect_memory.clear()
             st.session_state.debug_agent.reset()
             st.rerun()
         
+        # Show past architecture decisions
+        if st.session_state.agent_mode == "Architect Agent":
+            if st.session_state.architect_agent.architecture_memory:
+                with st.expander("📚 Past Architecture Decisions"):
+                    for idx, decision in enumerate(reversed(st.session_state.architect_agent.architecture_memory[-5:]), 1):
+                        st.caption(f"**Decision {idx}:** {decision['request'][:80]}...")
+        
         st.divider()
         
-        st.header("📋 Available Tools")
-        st.markdown("""
-        - **PDF_Search**: Query the PDF document
-        - **Weather**: Get weather for any city
-        - **Web_Scraper**: Extract text from URLs
-        - **Web_Search**: Search the internet (like Google)
-        - **🐛 Debug Agent**: Intelligent bug analysis
-        """)
+        st.header("📋 Available Capabilities")
+        if st.session_state.agent_mode == "Generic Agent":
+            st.markdown("""
+            - **PDF_Search**: Query the PDF document
+            - **Weather**: Get weather for any city
+            - **Web_Scraper**: Extract text from URLs
+            - **Web_Search**: Search the internet
+            """)
+        elif st.session_state.agent_mode == "Debug Agent":
+            st.markdown("""
+            - **Investigation Mode**: Analyze bugs systematically
+            - **Root Cause Analysis**: Score potential causes
+            - **Verification Tests**: Generate test scenarios
+            - **Fix Strategies**: Provide prioritized solutions
+            """)
+        elif st.session_state.agent_mode == "Architect Agent":
+            st.markdown("""
+            - **Architecture Analysis**: Evaluate system designs
+            - **Trade-off Assessment**: Compare options
+            - **Risk Identification**: Surface hidden issues
+            - **Conditional Recommendations**: Context-aware advice
+            """)
         
         st.divider()
         
         st.header("💡 Example Questions")
-        st.markdown("""
-        **Normal Mode:**
-        - "What is the PDF about?"
-        - "What's the weather in London?"
-        - "Search for Python tutorials"
-        
-        **Debug Mode:**
-        - "My delete function works on PC but not on mobile"
-        - "Getting 'no token' error on iPhone Safari"
-        - "App crashes only sometimes on Android"
-        """)
+        if st.session_state.agent_mode == "Generic Agent":
+            st.markdown("""
+            - "What is the PDF about?"
+            - "What's the weather in London?"
+            - "Search for Python tutorials"
+            - "Scrape content from a website"
+            """)
+        elif st.session_state.agent_mode == "Debug Agent":
+            st.markdown("""
+            - "My delete function works on PC but not on mobile"
+            - "Getting 'no token' error on iPhone Safari"
+            - "App crashes only sometimes on Android"
+            - "Payment fails but only for some users"
+            """)
+        elif st.session_state.agent_mode == "Architect Agent":
+            st.markdown("""
+            - "I want to build a messaging app with user login using MERN stack"
+            - "Help me design a multi-tenant SaaS architecture"
+            - "What's the best way to implement real-time notifications?"
+            - "I need to architect a fintech payment system"
+            """)
 
     # Display chat messages
     for message in st.session_state.messages:
@@ -242,26 +312,21 @@ Always provide the most relevant and contextual answer based on the full convers
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Check if should use debug agent
-        # First check if debug mode is enabled
-        # Then check for debug keywords OR environmental signals
-        use_debug = st.session_state.debug_mode
-        
-        if not use_debug:
-            # Check for explicit debug keywords
-            use_debug = st.session_state.debug_agent.is_debug_query(prompt)
-        
-        if not use_debug:
-            # Check for environmental signals even without explicit bug keywords
-            from signal_detector import detect_signals, should_investigate
-            signals = detect_signals(prompt)
-            use_debug = should_investigate(signals)
+        # Route to appropriate agent based on mode
+        agent_mode = st.session_state.agent_mode
 
         # Get agent response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..." if not use_debug else "🐛 Analyzing with Debug Agent..."):
+            spinner_text = {
+                "Generic Agent": "Thinking...",
+                "Debug Agent": "🐛 Analyzing with Debug Agent...",
+                "Architect Agent": "🏗️ Architecting solution..."
+            }
+            
+            with st.spinner(spinner_text.get(agent_mode, "Thinking...")):
                 try:
-                    if use_debug:
+                    if agent_mode == "Debug Agent":
+                        # Use debug agent
                         # Extract conversation history from debug memory
                         history = ""
                         if hasattr(st.session_state.debug_memory, 'chat_memory') and hasattr(st.session_state.debug_memory.chat_memory, 'messages'):
@@ -337,8 +402,25 @@ Always provide the most relevant and contextual answer based on the full convers
                             )
                         
                         st.session_state.messages.append({"role": "assistant", "content": response if result["mode"] == "INVESTIGATION" else full_response})
+                    
+                    elif agent_mode == "Architect Agent":
+                        # Use architect agent with confidence mode if enabled
+                        response = st.session_state.architect_agent.analyze(
+                            prompt, 
+                            include_confidence=st.session_state.architect_confidence_mode
+                        )
+                        st.markdown(response)
+                        
+                        # Store in architect memory
+                        st.session_state.architect_memory.save_context(
+                            {"input": prompt},
+                            {"output": response}
+                        )
+                        
+                        st.session_state.messages.append({"role": "assistant", "content": response})
+                    
                     else:
-                        # Normal agent flow
+                        # Generic agent flow (default)
                         response = st.session_state.agent.run(prompt)
                         
                         # Clean up any error messages in the response
