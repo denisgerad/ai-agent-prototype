@@ -4,12 +4,11 @@ from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_ollama import OllamaLLM
-from langchain_classic.chains import RetrievalQA
-from langchain_classic.tools import Tool
-from langchain_classic.agents import initialize_agent, AgentType
-from langchain_classic.memory import ConversationBufferMemory
+from langchain_ollama import ChatOllama
+from langchain.tools import BaseTool, tool
+from langgraph.prebuilt import create_react_agent
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from pydantic import BaseModel, Field
 import requests
 import sys
 import os
@@ -27,100 +26,80 @@ CHROMA_DIR = "./chroma_db"
 # ---------------------------
 
 
-# ---------- CUSTOM TOOLS ----------
-def get_weather(city: str) -> str:
-    """Get current weather for a city"""
-    try:
-        resp = requests.get(f"https://wttr.in/{city}?format=3", timeout=5)
-        return resp.text
-    except:
-        return f"Could not fetch weather for {city}"
-
-def scrape_website(url: str) -> str:
-    """Scrape text content from a webpage"""
-    try:
-        loader = WebBaseLoader(url)
-        docs = loader.load()
-        return "\n".join([d.page_content[:1000] for d in docs])
-    except:
-        return f"Could not scrape {url}"
-
-def web_search(query: str) -> str:
-    """Search the web for general information"""
-    try:
-        search = DuckDuckGoSearchAPIWrapper()
-        results = search.run(query)
-        return results
-    except Exception as e:
-        return f"Search error: {str(e)}"
-# -------------------------------
 
 
 @st.cache_resource
-def initialize_agent_system():
-    """Initialize the RAG system and agent (cached)"""
-    
-    # Load PDF
-    loader = PyPDFLoader(PDF_PATH)
+def initialize_llm_and_embeddings():
+    """Initialize just the LLM and embedding model (cached)"""
+    llm = ChatOllama(model=OLLAMA_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    return llm, embeddings
+
+
+def build_pdf_tool(pdf_path: str, llm, embeddings):
+    """Build a PDF search tool from a given PDF path"""
+    loader = PyPDFLoader(pdf_path)
     documents = loader.load()
 
-    # Chunk documents
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(documents)
 
-    # Create embeddings
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL
-    )
-
-    # Create vector store
     vectordb = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
         persist_directory=CHROMA_DIR
     )
 
-    # Initialize LLM
-    llm = OllamaLLM(model=OLLAMA_MODEL)
+    retriever = vectordb.as_retriever(search_kwargs={"k": 4})
 
-    # PDF QA
-    qa = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=vectordb.as_retriever(search_kwargs={"k": 4}),
-        return_source_documents=False
-    )
+    @tool
+    def pdf_search(question: str) -> str:
+        """Use this to answer questions about the uploaded PDF document. Input should be a clear question about the PDF content."""
+        docs = retriever.invoke(question)
+        context = "\n".join([d.page_content for d in docs])
+        prompt = f"Based on this context:\n{context}\n\nAnswer this question: {question}"
+        return llm.invoke(prompt)
 
-    # Tools
-    pdf_tool = Tool(
-        name="PDF_Search",
-        func=qa.invoke,
-        description="Use this to answer questions about the uploaded PDF document. Input should be a clear question about the PDF content."
-    )
+    return pdf_search
 
-    weather_tool = Tool(
-        name="Weather",
-        func=get_weather,
-        description="Get current weather for a city. Input should be a city name."
-    )
 
-    web_scraper_tool = Tool(
-        name="Web_Scraper",
-        func=scrape_website,
-        description="Scrape text content from a webpage. Input should be a valid URL starting with http:// or https://"
-    )
+def build_tools(llm, embeddings, pdf_path: str = None):
+    """Build all tools, optionally including a PDF tool"""
 
-    web_search_tool = Tool(
-        name="Web_Search",
-        func=web_search,
-        description="Search the internet for general information, facts, news, or any topic. Use this for questions that require current information or general knowledge from the web. IMPORTANT: When using this tool, include relevant context from the conversation history in your search query to get accurate results."
-    )
+    @tool
+    def weather(city: str) -> str:
+        """Get current weather for a city. Input should be a city name."""
+        try:
+            resp = requests.get(f"https://wttr.in/{city}?format=3", timeout=5)
+            return resp.text
+        except Exception:
+            return f"Could not fetch weather for {city}"
 
-    tools = [pdf_tool, weather_tool, web_scraper_tool, web_search_tool]
+    @tool
+    def web_scraper(url: str) -> str:
+        """Scrape text content from a webpage. Input should be a valid URL starting with http:// or https://"""
+        try:
+            web_loader = WebBaseLoader(url)
+            docs = web_loader.load()
+            return "\n".join([d.page_content[:1000] for d in docs])
+        except Exception:
+            return f"Could not scrape {url}"
 
-    return llm, tools
+    @tool
+    def web_search(query: str) -> str:
+        """Search the internet for general information, facts, news, or any topic."""
+        try:
+            search = DuckDuckGoSearchAPIWrapper()
+            return search.run(query)
+        except Exception as e:
+            return f"Search error: {str(e)}"
+
+    tools = [weather, web_scraper, web_search]
+
+    if pdf_path and os.path.isfile(pdf_path):
+        tools.insert(0, build_pdf_tool(pdf_path, llm, embeddings))
+
+    return tools
 
 
 def main():
@@ -147,57 +126,16 @@ def main():
         st.session_state.debug_agent = DebugAgent()
     
     if "architect_agent" not in st.session_state:
-        # Initialize with the LLM wrapper
-        llm, _ = initialize_agent_system()
+        llm, _ = initialize_llm_and_embeddings()
         st.session_state.architect_agent = ArchitectAgent(model=lambda prompt: llm.invoke(prompt))
-    
-    if "debug_memory" not in st.session_state:
-        st.session_state.debug_memory = ConversationBufferMemory(
-            memory_key="debug_history",
-            return_messages=True,
-            output_key="output"
-        )
-    
-    if "architect_memory" not in st.session_state:
-        st.session_state.architect_memory = ConversationBufferMemory(
-            memory_key="architect_history",
-            return_messages=True,
-            output_key="output"
-        )
     
     if "agent" not in st.session_state:
         with st.spinner("🔧 Initializing agent system..."):
-            llm, tools = initialize_agent_system()
-            
-            # Create memory
-            memory = ConversationBufferMemory(
-                memory_key="chat_history",
-                return_messages=True,
-                output_key="output"
-            )
-            
-            # Create agent
-            st.session_state.agent = initialize_agent(
-                tools=tools,
-                llm=llm,
-                agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
-                verbose=False,
-                handle_parsing_errors=True,
-                max_iterations=10,
-                max_execution_time=60,
-                early_stopping_method="generate",
-                memory=memory,
-                agent_kwargs={
-                    "prefix": """Assistant is a helpful AI that can use tools to answer questions. When the user asks a follow-up question, always consider the previous conversation context to understand what they're referring to. If you need to search for information, include the relevant topic from the conversation history in your search query.
-
-For example:
-- If the conversation is about "one tap trading" and the user asks "list popular apps", search for "popular one tap trading apps".
-- If discussing a city and asked "what's the temperature", use that city name.
-
-Always provide the most relevant and contextual answer based on the full conversation."""
-                }
-            )
-            st.session_state.memory = memory
+            llm, embeddings = initialize_llm_and_embeddings()
+            tools = build_tools(llm, embeddings)
+            st.session_state.agent = create_react_agent(llm, tools)
+            st.session_state.llm = llm
+            st.session_state.embeddings = embeddings
         st.success("✅ Agent ready!")
 
     # Sidebar
@@ -235,11 +173,24 @@ Always provide the most relevant and contextual answer based on the full convers
         elif st.session_state.agent_mode == "Architect Agent":
             st.info("🏗️ Architect Agent - System architecture analysis")
         
+        st.divider()
+        st.subheader("📄 PDF Upload")
+        uploaded_pdf = st.file_uploader("Upload a PDF to enable PDF search", type="pdf")
+        if uploaded_pdf is not None:
+            import tempfile
+            tmp_path = os.path.join(tempfile.gettempdir(), uploaded_pdf.name)
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded_pdf.getbuffer())
+            if st.session_state.get("pdf_path") != tmp_path:
+                st.session_state.pdf_path = tmp_path
+                # Rebuild tools with the new PDF and recreate agent
+                with st.spinner("📄 Processing PDF..."):
+                    tools = build_tools(st.session_state.llm, st.session_state.embeddings, tmp_path)
+                    st.session_state.agent = create_react_agent(st.session_state.llm, tools)
+                st.success(f"✅ PDF loaded: {uploaded_pdf.name}")
+        
         if st.button("🗑️ Clear Conversation", use_container_width=True):
             st.session_state.messages = []
-            st.session_state.memory.clear()
-            st.session_state.debug_memory.clear()
-            st.session_state.architect_memory.clear()
             st.session_state.debug_agent.reset()
             st.rerun()
         
@@ -254,8 +205,9 @@ Always provide the most relevant and contextual answer based on the full convers
         
         st.header("📋 Available Capabilities")
         if st.session_state.agent_mode == "Generic Agent":
-            st.markdown("""
-            - **PDF_Search**: Query the PDF document
+            pdf_status = "✅ PDF_Search: Query the PDF document" if st.session_state.get("pdf_path") else "⬆️ Upload a PDF to enable PDF search"
+            st.markdown(f"""
+            - {pdf_status}
             - **Weather**: Get weather for any city
             - **Web_Scraper**: Extract text from URLs
             - **Web_Search**: Search the internet
@@ -327,15 +279,11 @@ Always provide the most relevant and contextual answer based on the full convers
                 try:
                     if agent_mode == "Debug Agent":
                         # Use debug agent
-                        # Extract conversation history from debug memory
+                        # Build conversation history from session messages
                         history = ""
-                        if hasattr(st.session_state.debug_memory, 'chat_memory') and hasattr(st.session_state.debug_memory.chat_memory, 'messages'):
-                            for msg in st.session_state.debug_memory.chat_memory.messages:
-                                if hasattr(msg, 'type'):
-                                    if msg.type == 'human':
-                                        history += f"User: {msg.content}\n"
-                                    elif msg.type == 'ai':
-                                        history += f"Assistant: {msg.content}\n"
+                        for msg in st.session_state.messages[:-1]:  # exclude current prompt
+                            role = "User" if msg["role"] == "user" else "Assistant"
+                            history += f"{role}: {msg['content']}\n"
                         
                         # Handle with debug agent
                         result = st.session_state.debug_agent.handle(prompt, conversation_history=history)
@@ -343,14 +291,9 @@ Always provide the most relevant and contextual answer based on the full convers
                         if result["mode"] == "INVESTIGATION":
                             response = result["formatted_response"]
                             st.markdown(response)
-                            # Store in debug memory
-                            st.session_state.debug_memory.save_context(
-                                {"input": prompt},
-                                {"output": response}
-                            )
                         else:
                             # ANALYSIS mode - send to LLM
-                            llm, _ = initialize_agent_system()
+                            llm, _ = initialize_llm_and_embeddings()
                             response = llm.invoke(result["prompt"])
                             
                             # Display the LLM analysis first
@@ -394,12 +337,6 @@ Always provide the most relevant and contextual answer based on the full convers
                                 full_response += "\n\n" + result["inspection_checklist"]
                             if result.get("fix_strategies") and not result.get("confirmation_gate"):
                                 full_response += "\n\n" + result["fix_strategies"]
-                            
-                            # Store in debug memory
-                            st.session_state.debug_memory.save_context(
-                                {"input": prompt},
-                                {"output": full_response}
-                            )
                         
                         st.session_state.messages.append({"role": "assistant", "content": response if result["mode"] == "INVESTIGATION" else full_response})
                     
@@ -410,25 +347,18 @@ Always provide the most relevant and contextual answer based on the full convers
                             include_confidence=st.session_state.architect_confidence_mode
                         )
                         st.markdown(response)
-                        
-                        # Store in architect memory
-                        st.session_state.architect_memory.save_context(
-                            {"input": prompt},
-                            {"output": response}
-                        )
-                        
                         st.session_state.messages.append({"role": "assistant", "content": response})
                     
                     else:
                         # Generic agent flow (default)
-                        response = st.session_state.agent.run(prompt)
+                        from langchain_core.messages import HumanMessage
+                        response = st.session_state.agent.invoke({"messages": [HumanMessage(content=prompt)]})
                         
-                        # Clean up any error messages in the response
-                        if "For troubleshooting, visit:" in response:
-                            response = response.split("For troubleshooting, visit:")[0].strip()
+                        # Extract response from agent output
+                        response_text = response.get("messages", [])[-1].content if response.get("messages") else str(response)
                         
-                        st.markdown(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
+                        st.markdown(response_text)
+                        st.session_state.messages.append({"role": "assistant", "content": response_text})
                 except Exception as e:
                     error_str = str(e)
                     
