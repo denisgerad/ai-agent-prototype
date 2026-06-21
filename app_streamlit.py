@@ -12,6 +12,52 @@ from pydantic import BaseModel, Field
 import requests
 import sys
 import os
+import logging
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('agent_search.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ===== INTERCEPT HTTPX TO LOG API REQUESTS =====
+import httpx
+original_post = httpx.Client.post
+original_post_async = httpx.AsyncClient.post
+
+def log_post(self, *args, **kwargs):
+    """Log httpx POST requests"""
+    try:
+        if 'ollama' in str(args) or '11434' in str(args):
+            logger.info(f"[OLLAMA] POST request to: {args[0] if args else 'unknown'}")
+            if 'json' in kwargs and kwargs['json']:
+                json_payload = kwargs['json']
+                logger.info(f"[OLLAMA] Request body: {json.dumps(json_payload, indent=2, default=str)[:1000]}")
+    except Exception as e:
+        logger.debug(f"[OLLAMA] Logging error: {e}")
+    return original_post(self, *args, **kwargs)
+
+async def log_post_async(self, *args, **kwargs):
+    """Log async httpx POST requests"""
+    try:
+        if 'ollama' in str(args) or '11434' in str(args):
+            logger.info(f"[OLLAMA_ASYNC] POST request to: {args[0] if args else 'unknown'}")
+            if 'json' in kwargs and kwargs['json']:
+                json_payload = kwargs['json']
+                logger.info(f"[OLLAMA_ASYNC] Request body: {json.dumps(json_payload, indent=2, default=str)[:1000]}")
+    except Exception as e:
+        logger.debug(f"[OLLAMA_ASYNC] Logging error: {e}")
+    return await original_post_async(self, *args, **kwargs)
+
+httpx.Client.post = log_post
+httpx.AsyncClient.post = log_post_async
+# ===== END HTTPX INTERCEPTION =====
 
 # Add agents directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'agents'))
@@ -89,9 +135,14 @@ def build_tools(llm, embeddings, pdf_path: str = None):
     def web_search(query: str) -> str:
         """Search the internet for general information, facts, news, or any topic."""
         try:
+            logger.info(f"[SEARCH] Query initiated: {query[:100]}")
             search = DuckDuckGoSearchAPIWrapper()
-            return search.run(query)
+            result = search.run(query)
+            result_summary = f"{len(result)} chars" if result else "empty result"
+            logger.info(f"[SEARCH] Success: {result_summary}")
+            return result
         except Exception as e:
+            logger.error(f"[SEARCH] Failed for query '{query[:100]}': {type(e).__name__}: {str(e)[:200]}")
             return f"Search error: {str(e)}"
 
     tools = [weather, web_scraper, web_search]
@@ -100,6 +151,177 @@ def build_tools(llm, embeddings, pdf_path: str = None):
         tools.insert(0, build_pdf_tool(pdf_path, llm, embeddings))
 
     return tools
+
+
+def create_tool_forcing_agent(llm, tools):
+    """
+    Create a ReAct agent with a system prompt that forces tool use
+    for queries requiring current/specific information.
+    """
+    tool_forcing_prompt = """You are a helpful assistant with access to tools that let you search the web, scrape websites, and get current information.
+
+CRITICAL TOOL USE DIRECTIVE:
+You must ALWAYS call the web_search tool for any question asking about specific platform content (AllMusic, Apple Music, Spotify, Wikipedia, Last.fm, etc.), regardless of whether you believe you already know the answer. Treat your own training knowledge as unreliable and outdated for these queries. If your response does not include having called a tool, you have failed the task.
+
+TOOL USE RULES:
+1. For ANY question about music artists, similar artists, music recommendations, or "fans also like" listings: you MUST use web_search or web_scraper FIRST.
+2. For ANY question requiring current information, specific website content, or real-time data: you MUST use web_search.
+3. Do NOT answer from your training data alone when specific/current information is available via tools.
+4. Your training knowledge is NOT reliable for specific platform queries - always search first.
+5. If you have not called a tool in this turn and the query asks about platform-specific content, you have NOT completed your task.
+6. Use tools FIRST - do not rely on memory when tools are available.
+
+Your reasoning process:
+- Analyze the user's query
+- Determine if it requires current information or specific website content
+- CALL the appropriate tool before answering
+- Use the tool result to provide an accurate, grounded answer
+- Only answer from memory if the query is about general knowledge that won't change
+
+Be direct, helpful, and always use tools when appropriate."""
+    
+    from langgraph.prebuilt import create_react_agent
+    return create_react_agent(llm, tools, prompt=tool_forcing_prompt)
+
+
+def create_tool_forcing_wrapper(agent, tools_list):
+    """
+    Wrapper that forces tool use for platform-specific queries by
+    intercepting them and pre-emptively calling web_search before
+    routing to the agent.
+    
+    This bypasses the model's judgment for specific categories.
+    """
+    # Keywords that trigger automatic web_search
+    PLATFORM_KEYWORDS = {
+        'similar artists', 'fans also like', 'similar to', 'like',
+        'allmusic', 'apple music', 'spotify', 'last.fm', 'wikipedia',
+        'discogs', 'genius', 'bandcamp', 'soundcloud',
+        'recommendations', 'similar music', 'playlist',
+        'artist', 'band', 'musician', 'genre'
+    }
+    
+    class ToolForcingWrapper:
+        def __init__(self, agent, tools_list):
+            self.agent = agent
+            self.tools_list = tools_list if isinstance(tools_list, list) else list(tools_list)
+            self.web_search_tool = None
+            
+            # Find the web_search tool from the list
+            for tool in self.tools_list:
+                try:
+                    tool_name = getattr(tool, 'name', None)
+                    if tool_name == 'web_search':
+                        self.web_search_tool = tool
+                        logger.info(f"[TOOL_FORCING] Found web_search tool: {tool}")
+                        break
+                except Exception as e:
+                    logger.debug(f"[TOOL_FORCING] Error checking tool: {e}")
+        
+        def invoke(self, state):
+            """Intercept agent invocation and force tool use if needed"""
+            from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+            
+            messages = state.get("messages", [])
+            
+            # Get the last user message
+            user_message = None
+            for msg in reversed(messages):
+                if isinstance(msg, HumanMessage):
+                    user_message = msg.content
+                    break
+            
+            if user_message:
+                query_lower = user_message.lower()
+                
+                # Check if query contains platform keywords
+                needs_search = any(keyword in query_lower for keyword in PLATFORM_KEYWORDS)
+                
+                if needs_search:
+                    logger.info(f"[TOOL_FORCING] Query needs platform search: '{query_lower[:80]}'")
+                    
+                    # Pre-emptively call web_search with focused, platform-specific queries
+                    if self.web_search_tool:
+                        try:
+                            import re
+                            
+                            # Extract artist name from the user message
+                            # Look for patterns like "Search for X's similar artists" or "similar artists [for/of] X"
+                            artist_name = None
+                            
+                            # Try to extract from "search for X's" or "search for X and"
+                            match = re.search(r'search\s+for\s+([^\'"\n]+?)(?:\'s|\'|\s+(?:and|or|on|similar))', user_message, re.IGNORECASE)
+                            if match:
+                                artist_name = match.group(1).strip()
+                            
+                            # Fallback: look for quoted names
+                            if not artist_name:
+                                match = re.search(r'"([^"]+)"', user_message)
+                                if match:
+                                    artist_name = match.group(1).strip()
+                            
+                            # Final fallback: just grab first few meaningful words
+                            if not artist_name:
+                                words = [w for w in user_message.split() if len(w) > 2 and w.lower() not in ['search', 'for', 'the', 'and', 'from', 'about']]
+                                if words:
+                                    artist_name = ' '.join(words[:2])
+                            
+                            if not artist_name:
+                                artist_name = "artist"
+                            
+                            logger.info(f"[TOOL_FORCING] Extracted artist name: '{artist_name}'")
+                            
+                            # Create three focused platform-specific queries
+                            platform_queries = [
+                                f"{artist_name} similar artists AllMusic",
+                                f"{artist_name} fans also like Apple Music", 
+                                f"{artist_name} similar artists Spotify"
+                            ]
+                            
+                            # Execute searches and combine results
+                            all_results = []
+                            for platform_query in platform_queries:
+                                logger.info(f"[TOOL_FORCING] Executing focused query: '{platform_query}'")
+                                try:
+                                    result = self.web_search_tool.invoke(platform_query)
+                                    all_results.append(result)
+                                    logger.info(f"[TOOL_FORCING] Platform query result: {len(result)} chars")
+                                except Exception as e:
+                                    logger.error(f"[TOOL_FORCING] Platform query failed: {e}")
+                            
+                            # Combine all results
+                            search_result = "\n---\n".join(all_results) if all_results else "No results found"
+                            logger.info(f"[TOOL_FORCING] Combined search result: {len(search_result)} chars")
+                            
+                            # Inject the search result as a tool message in the state
+                            # This simulates the tool having been called
+                            tool_msg = ToolMessage(
+                                content=search_result,
+                                tool_call_id="forced_web_search",
+                                name="web_search"
+                            )
+                            
+                            # Add a fake agent message that "called" the tool
+                            from langchain_core.messages.tool import ToolCall
+                            agent_msg = AIMessage(
+                                content="",
+                                tool_calls=[ToolCall(id="forced_web_search", name="web_search", args={"query": f"similar artists for {artist_name}"})]
+                            )
+                            
+                            # Insert these before the final agent call
+                            state["messages"] = messages + [agent_msg, tool_msg]
+                            logger.info(f"[TOOL_FORCING] Injected pre-search into message state")
+                        except Exception as e:
+                            logger.error(f"[TOOL_FORCING] Pre-search failed: {type(e).__name__}: {e}")
+                    else:
+                        logger.warning("[TOOL_FORCING] web_search tool not found in tools list")
+            
+            # Now invoke the actual agent
+            logger.info(f"[TOOL_FORCING] Invoking agent with {len(state.get('messages', []))} messages")
+            result = self.agent.invoke(state)
+            return result
+    
+    return ToolForcingWrapper(agent, tools_list)
 
 
 def main():
@@ -133,7 +355,10 @@ def main():
         with st.spinner("🔧 Initializing agent system..."):
             llm, embeddings = initialize_llm_and_embeddings()
             tools = build_tools(llm, embeddings)
-            st.session_state.agent = create_react_agent(llm, tools)
+            logger.info(f"[AGENT_INIT] Building agent with {len(tools)} tools: {[t.name if hasattr(t, 'name') else str(t) for t in tools]}")
+            base_agent = create_tool_forcing_agent(llm, tools)
+            # Wrap with tool-forcing interceptor
+            st.session_state.agent = create_tool_forcing_wrapper(base_agent, tools)
             st.session_state.llm = llm
             st.session_state.embeddings = embeddings
         st.success("✅ Agent ready!")
@@ -186,7 +411,8 @@ def main():
                 # Rebuild tools with the new PDF and recreate agent
                 with st.spinner("📄 Processing PDF..."):
                     tools = build_tools(st.session_state.llm, st.session_state.embeddings, tmp_path)
-                    st.session_state.agent = create_react_agent(st.session_state.llm, tools)
+                    base_agent = create_tool_forcing_agent(st.session_state.llm, tools)
+                    st.session_state.agent = create_tool_forcing_wrapper(base_agent, tools)
                 st.success(f"✅ PDF loaded: {uploaded_pdf.name}")
         
         if st.button("🗑️ Clear Conversation", use_container_width=True):
@@ -352,7 +578,35 @@ def main():
                     else:
                         # Generic agent flow (default)
                         from langchain_core.messages import HumanMessage
+                        
+                        logger.info(f"[AGENT] Generic Agent invoked with query: {prompt[:100]}")
+                        
+                        # Log agent graph structure
+                        try:
+                            agent_graph = st.session_state.agent
+                            if hasattr(agent_graph, 'nodes'):
+                                logger.info(f"[AGENT] Agent graph nodes: {list(agent_graph.nodes.keys())}")
+                            if hasattr(agent_graph, 'get_graph'):
+                                logger.info(f"[AGENT] Agent has get_graph method")
+                        except Exception as e:
+                            logger.debug(f"[AGENT] Could not inspect agent graph: {e}")
+                        
                         response = st.session_state.agent.invoke({"messages": [HumanMessage(content=prompt)]})
+                        
+                        # Log the full response to understand reasoning
+                        messages = response.get("messages", [])
+                        logger.info(f"[AGENT] Response contains {len(messages)} messages")
+                        for i, msg in enumerate(messages):
+                            msg_type = type(msg).__name__
+                            logger.info(f"[AGENT] Message {i}: {msg_type}")
+                            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                tool_names = []
+                                for tc in msg.tool_calls:
+                                    tool_names.append(getattr(tc, 'name', getattr(tc, 'tool', 'unknown')))
+                                logger.info(f"[AGENT]   -> Tool calls: {tool_names}")
+                            if hasattr(msg, 'content'):
+                                content_preview = str(msg.content)[:150] if msg.content else "(empty)"
+                                logger.info(f"[AGENT]   -> Content: {content_preview}")
                         
                         # Extract response from agent output
                         response_text = response.get("messages", [])[-1].content if response.get("messages") else str(response)
